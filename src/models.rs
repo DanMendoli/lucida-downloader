@@ -1,5 +1,7 @@
+use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use clap::{Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
@@ -52,6 +54,10 @@ pub struct Cli {
     #[arg(long)]
     pub private: bool,
 
+    /// audio format/quality to request from lucida
+    #[arg(long, default_value_t = String::from("original"))]
+    pub downscale: String,
+
     /// amount of albums to download simultaneously
     #[arg(long, default_value_t = 1)]
     pub album_workers: usize,
@@ -90,11 +96,15 @@ pub enum Availability {
     Unavailable,
 }
 
+pub type FormatStats = Arc<Mutex<HashMap<String, usize>>>;
+
 #[derive(Clone)]
 pub struct DownloadConfig {
     pub country: String,
     pub metadata: bool,
     pub private: bool,
+    pub downscale: String,
+    pub format_stats: FormatStats,
 }
 
 #[derive(Clone, Copy)]
@@ -277,7 +287,7 @@ pub enum Service {
 pub struct TrackDownloadRequest<'a> {
     pub account: Account<'a>,
     pub compat: bool,
-    pub downscale: &'static str,
+    pub downscale: &'a str,
     pub handoff: bool,
     pub metadata: bool,
     pub private: bool,

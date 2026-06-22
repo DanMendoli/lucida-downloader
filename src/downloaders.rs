@@ -144,7 +144,7 @@ async fn resolve_album(
 ) -> Option<PageData> {
     eprintln!("[WORKER {album_worker}] resolving album {url}");
 
-    let html = loop {
+    loop {
         let html =
             requests::resolve_album(client, url, &config.country, running, album_worker).await?;
 
@@ -163,19 +163,29 @@ async fn resolve_album(
             }
 
             time::sleep(Duration::from_secs(5)).await;
-        } else {
-            break html;
+            continue;
         }
-    };
 
-    Some(
-        json5::from_str(text_utils::parse_enclosed_value(
+        let data_json = text_utils::parse_enclosed_value(
             ",{\"type\":\"data\",\"data\":",
             ",\"uses\":{\"url\":1}}];\n",
             &html,
-        ))
-        .unwrap(),
-    )
+        );
+
+        match json5::from_str::<PageData>(data_json) {
+            Ok(page_data) => return Some(page_data),
+            Err(err) => {
+                eprintln!("[WORKER {album_worker}] failed to parse album data: {err}");
+                eprintln!("[WORKER {album_worker}] extracted JSON snippet: {data_json:.200}");
+
+                if !running.load(Ordering::Relaxed) {
+                    return None;
+                }
+
+                time::sleep(Duration::from_secs(5)).await;
+            }
+        }
+    }
 }
 
 #[expect(
@@ -251,12 +261,17 @@ async fn request_track_download(
     running: Arc<AtomicBool>,
     workers: WorkerIds,
 ) {
+    let mut current_downscale = config.downscale.clone();
+
     'request_track_download: loop {
+        let mut current_config = config.clone();
+        current_config.downscale = current_downscale.clone();
+
         let Some(track_download) = requests::request_track_download(
             &client,
             track,
             token_expiry,
-            config,
+            &current_config,
             running.clone(),
             workers,
         )
@@ -290,7 +305,7 @@ async fn request_track_download(
 
                 last_status = Some((
                     track_download.status.clone(),
-                    track_download.message,
+                    track_download.message.clone(),
                     Instant::now(),
                 ));
             } else if let Some(last_status) = last_status.as_ref()
@@ -315,18 +330,43 @@ async fn request_track_download(
                 break;
             }
 
+            if track_download.status == "error" {
+                if current_downscale != "original" {
+                    eprintln!(
+                        "{workers} conversion failed for {}, falling back to original format",
+                        track.title
+                    );
+                    current_downscale = String::from("original");
+                    continue 'request_track_download;
+                }
+
+                eprintln!(
+                    "{workers} track processing failed, retrying from start: {}",
+                    track_download.message.replace("{item}", &track.title)
+                );
+                continue 'request_track_download;
+            }
+
             time::sleep(Duration::from_secs(1)).await;
         }
 
-        download_track(
-            client,
+        if !download_track(
+            client.clone(),
             track_download,
-            album_path,
-            file_stem,
-            running,
+            album_path.clone(),
+            file_stem.clone(),
+            &current_config,
+            running.clone(),
             workers,
         )
-        .await;
+        .await
+        {
+            if !running.load(Ordering::Relaxed) {
+                return;
+            }
+
+            continue 'request_track_download;
+        }
 
         break;
     }
@@ -337,47 +377,68 @@ async fn download_track(
     track_download: TrackDownload,
     album_path: Arc<PathBuf>,
     file_stem: String,
+    config: &DownloadConfig,
     running: Arc<AtomicBool>,
     workers: WorkerIds,
-) {
-    'download_track: loop {
-        let Some((mut rx, mime_type)) =
-            requests::download_track(&client, &track_download, workers).await
-        else {
-            if !running.load(Ordering::Relaxed) {
-                return;
-            }
-
-            continue;
-        };
-
-        let file_extension = match mime_type
-            .split_once(';')
-            .map_or(mime_type.as_str(), |(mime_type, _)| mime_type)
-        {
-            "audio/flac" => "flac",
-            "audio/mpeg" => "mp3",
-            "audio/mp4" => "m4a",
-            _ => panic!("unsupported mime type {mime_type}"),
-        };
-
-        let file_name = format!("{file_stem}.{file_extension}");
-        let part_path = album_path.join(format!("{file_name}.part"));
-        let mut file = BufWriter::new(File::create(&part_path).await.unwrap());
-
-        while let Some(result) = rx.recv().await {
-            match result {
-                Ok(chunk) => file.write_all(&chunk).await.unwrap(),
-                Err(()) => continue 'download_track,
-            }
+) -> bool {
+    let Some((mut rx, mime_type)) =
+        requests::download_track(&client, &track_download, workers).await
+    else {
+        if !running.load(Ordering::Relaxed) {
+            return false;
         }
 
-        fs::rename(part_path, album_path.join(file_name))
-            .await
-            .unwrap();
+        eprintln!("{workers} failed to start track download, retrying from start");
+        return false;
+    };
 
-        break;
+    let file_extension = match mime_type
+        .split_once(';')
+        .map_or(mime_type.as_str(), |(mime_type, _)| mime_type)
+    {
+        "audio/flac" => "flac",
+        "audio/mpeg" => "mp3",
+        "audio/mp4" | "audio/m4a" | "audio/x-m4a" => "m4a",
+        _ => {
+            eprintln!("{workers} unknown mime type {mime_type}, inferring extension from downscale");
+            match config.downscale.as_str() {
+                "m4a-aac-320" => "m4a",
+                "mp3-320" | "mp3" => "mp3",
+                "original" | "flac" | "lossless" => "flac",
+                _ => {
+                    eprintln!("{workers} falling back to .bin extension");
+                    "bin"
+                }
+            }
+        }
+    };
+
+    let file_name = format!("{file_stem}.{file_extension}");
+    let part_path = album_path.join(format!("{file_name}.part"));
+    let mut file = BufWriter::new(File::create(&part_path).await.unwrap());
+
+    while let Some(result) = rx.recv().await {
+        if let Ok(chunk) = result {
+            file.write_all(&chunk).await.unwrap();
+        } else {
+            eprintln!("{workers} error receiving track chunk, retrying from start");
+            return false;
+        }
     }
+
+    fs::rename(part_path, album_path.join(&file_name))
+        .await
+        .unwrap();
+
+    config
+        .format_stats
+        .lock()
+        .unwrap()
+        .entry(file_extension.to_string())
+        .and_modify(|count| *count += 1)
+        .or_insert(1);
+
+    true
 }
 
 #[expect(

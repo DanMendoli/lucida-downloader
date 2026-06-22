@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -35,6 +36,7 @@ const CAPTCHA_PROMPT: &str = concat!(
 );
 
 #[tokio::main(flavor = "current_thread")]
+#[allow(clippy::too_many_lines)]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
 
@@ -44,7 +46,9 @@ async fn main() -> ExitCode {
         let mut lines = BufReader::new(File::open(file).await.unwrap()).lines();
 
         while let Some(line) = lines.next_line().await.unwrap() {
-            urls.push(line);
+            if !line.trim().is_empty() {
+                urls.push(line);
+            }
         }
     }
 
@@ -111,6 +115,7 @@ async fn main() -> ExitCode {
     });
 
     let output = cli.output.unwrap_or_else(|| env::current_dir().unwrap());
+    let format_stats: Arc<Mutex<HashMap<String, usize>>> = Arc::new(Mutex::new(HashMap::new()));
 
     for result in future::join_all((1..=worker_count).map(|album_worker| {
         tokio::spawn(workers::run_album_worker(
@@ -125,6 +130,8 @@ async fn main() -> ExitCode {
                 country: cli.country.clone(),
                 metadata: !cli.no_metadata,
                 private: cli.private,
+                downscale: cli.downscale.clone(),
+                format_stats: format_stats.clone(),
             },
             cli.track_workers,
             SkipConfig {
@@ -138,6 +145,19 @@ async fn main() -> ExitCode {
     .await
     {
         result.unwrap();
+    }
+
+    let stats = format_stats.lock().unwrap();
+    let formats: Vec<_> = stats.iter().map(|(k, v)| (k.clone(), *v)).collect();
+    drop(stats);
+
+    if !formats.is_empty() {
+        eprintln!("download summary:");
+        let mut formats = formats;
+        formats.sort_by_key(|(format, _)| format.clone());
+        for (format, count) in formats {
+            eprintln!("  {format}: {count}");
+        }
     }
 
     eprintln!("finished!");
