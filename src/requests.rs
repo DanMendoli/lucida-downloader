@@ -8,8 +8,8 @@ use tokio::sync::mpsc::{self, UnboundedReceiver};
 use tokio::time;
 
 use crate::models::{
-    Account, Availability, DownloadConfig, Token, Track, TrackDownload, TrackDownloadRequest,
-    TrackDownloadResult, TrackDownloadStatus, Upload, WorkerIds,
+    Account, Availability, DownloadConfig, ResolveAlbumResult, Token, Track, TrackDownload,
+    TrackDownloadRequest, TrackDownloadResult, TrackDownloadStatus, Upload, WorkerIds,
 };
 
 const IRRECOVERABLE_STATUS_CODES: [StatusCode; 2] =
@@ -17,11 +17,36 @@ const IRRECOVERABLE_STATUS_CODES: [StatusCode; 2] =
 
 pub async fn check_availability(client: &Client) -> Availability {
     let response = client.get("https://lucida.to/").send().await.unwrap();
+    let status = response.status();
 
-    match response.status() {
-        StatusCode::OK => Availability::Available,
+    eprintln!("[check] status: {status}");
+
+    match status {
+        StatusCode::OK => {
+            let html = response.text().await.unwrap();
+            eprintln!("[check] html length: {}", html.len());
+
+            if html.contains("challenge-platform")
+                || html.contains("cf-chl-widget-")
+                || html.contains("Checking your browser before accessing")
+                || html.contains("__cf_chl_jschl_tk__")
+            {
+                eprintln!("[check] detected Cloudflare challenge in HTML");
+                Availability::Captcha
+            } else if html.contains("Welcome to the world of Lucida")
+                || html.contains("download-form")
+            {
+                Availability::Available
+            } else {
+                eprintln!("[check] unknown HTML content: {}", &html[..html.len().min(200)]);
+                Availability::Unavailable
+            }
+        }
         StatusCode::FORBIDDEN => Availability::Captcha,
-        _ => Availability::Unavailable,
+        _ => {
+            eprintln!("[check] non-OK status: {status}");
+            Availability::Unavailable
+        }
     }
 }
 
@@ -31,8 +56,10 @@ pub async fn resolve_album(
     country: &str,
     running: &Arc<AtomicBool>,
     album_worker: usize,
-) -> Option<String> {
-    loop {
+) -> ResolveAlbumResult {
+    const MAX_RETRIES: usize = 5;
+
+    for attempt in 1..=MAX_RETRIES {
         let response = client
             .get(
                 Url::parse_with_params("https://lucida.to/", &[("url", url), ("country", country)])
@@ -44,21 +71,50 @@ pub async fn resolve_album(
 
         let status = response.status();
 
-        if status == StatusCode::OK {
-            break Some(response.text().await.unwrap());
+        match status {
+            StatusCode::OK => {
+                let html = response.text().await.unwrap();
+                if html.contains("challenge-platform")
+                    || html.contains("cf-chl-widget-")
+                    || html.contains("Checking your browser before accessing")
+                    || html.contains("__cf_chl_jschl_tk__")
+                {
+                    eprintln!(
+                        "[WORKER {album_worker}] Cloudflare challenge in response HTML"
+                    );
+                    return ResolveAlbumResult::Cloudflare;
+                }
+                return ResolveAlbumResult::Success(html);
+            }
+            StatusCode::FORBIDDEN => {
+                eprintln!(
+                    "[WORKER {album_worker}] blocked by Cloudflare (403) when resolving album"
+                );
+                return ResolveAlbumResult::Cloudflare;
+            }
+            StatusCode::TOO_MANY_REQUESTS => {
+                eprintln!(
+                    "[WORKER {album_worker}] rate limited (429) when resolving album"
+                );
+                return ResolveAlbumResult::Error;
+            }
+            _ => {
+                eprintln!(
+                    "[WORKER {album_worker}] received code {} when resolving album (attempt {attempt}/{MAX_RETRIES})",
+                    status.as_u16()
+                );
+
+                if !running.load(Ordering::Relaxed) {
+                    return ResolveAlbumResult::Error;
+                }
+
+                time::sleep(Duration::from_secs(5)).await;
+            }
         }
-
-        eprintln!(
-            "[WORKER {album_worker}] received code {} when resolving album",
-            status.as_u16()
-        );
-
-        if !running.load(Ordering::Relaxed) {
-            break None;
-        }
-
-        time::sleep(Duration::from_secs(5)).await;
     }
+
+    eprintln!("[WORKER {album_worker}] giving up on resolving album after {MAX_RETRIES} attempts");
+    ResolveAlbumResult::Error
 }
 
 pub async fn request_track_download(
@@ -225,6 +281,59 @@ pub async fn download_track(
 
         time::sleep(Duration::from_secs(5)).await;
     }
+}
+
+/// Given an artist page URL, fetch it and extract all album URLs.
+pub async fn extract_albums_from_artist_page(client: &Client, url: &str) -> Vec<String> {
+    let response = match client.get(url).send().await {
+        Ok(r) => r,
+        Err(err) => {
+            eprintln!("failed to fetch artist page: {err}");
+            return Vec::new();
+        }
+    };
+
+    let status = response.status();
+    if status != StatusCode::OK {
+        eprintln!("artist page returned status {status}");
+        return Vec::new();
+    }
+
+    let html = match response.text().await {
+        Ok(h) => h,
+        Err(err) => {
+            eprintln!("failed to read artist page HTML: {err}");
+            return Vec::new();
+        }
+    };
+
+    let mut albums = Vec::new();
+
+    // Look for album links in the HTML. On lucida.to artist pages, album
+    // links typically look like:
+    //   href="/?url=https%3A%2F%2Fwww.qobuz.com%2F...%2Falbum%2F..."
+    for line in html.lines() {
+        let mut rest: &str = line;
+        while let Some(start) = rest.find("href=\"") {
+            rest = &rest[start + 6..];
+            if let Some(end) = rest.find('"') {
+                let href = &rest[..end];
+                rest = &rest[end..];
+
+                // Only keep links that point to an album on lucida.to
+                if href.starts_with("/?url=") && href.contains("/album/") {
+                    let full = format!("https://lucida.to{href}");
+                    if !albums.contains(&full) {
+                        albums.push(full);
+                    }
+                }
+            } else {
+                break;
+            }
+        }
+    }
+
+    albums
 }
 
 pub async fn download_album_cover(

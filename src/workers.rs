@@ -2,8 +2,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use reqwest::Client;
-
+use crate::browser_pool;
 use crate::downloaders;
 use crate::models::{AlbumYear, DownloadConfig, Service, SkipConfig, Track, WorkerIds};
 
@@ -12,7 +11,7 @@ use crate::models::{AlbumYear, DownloadConfig, Service, SkipConfig, Track, Worke
     reason = "this function is called from a single place"
 )]
 pub async fn run_album_worker(
-    client: Client,
+    shared_client: browser_pool::SharedClient,
     urls: Arc<Mutex<Vec<String>>>,
     output_path: PathBuf,
     force_download: bool,
@@ -32,7 +31,7 @@ pub async fn run_album_worker(
         };
 
         downloaders::download_album(
-            client.clone(),
+            shared_client.clone(),
             &url,
             &output_path,
             force_download,
@@ -57,7 +56,7 @@ pub async fn run_album_worker(
     reason = "this function is called from a single place"
 )]
 pub async fn run_track_worker(
-    client: Client,
+    shared_client: browser_pool::SharedClient,
     service: Service,
     tracks: Arc<Mutex<Vec<(Option<u32>, Track)>>>,
     track_count: u32,
@@ -75,7 +74,7 @@ pub async fn run_track_worker(
         };
 
         downloaders::request_and_download_track(
-            client.clone(),
+            shared_client.clone(),
             service,
             &track,
             track_number,

@@ -82,6 +82,16 @@ pub struct Cli {
     /// the User-Agent header to use
     #[arg(long)]
     pub user_agent: Option<String>,
+
+    /// automatically extract cf_clearance and User-Agent from your Chromium
+    /// browser profile
+    #[arg(long)]
+    pub auto_cookies: bool,
+
+    /// use a headless Chromium browser to resolve album pages, bypassing
+    /// Cloudflare protection entirely
+    #[arg(long)]
+    pub headless: bool,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -94,6 +104,16 @@ pub enum Availability {
     Available,
     Captcha,
     Unavailable,
+}
+
+/// Result of attempting to resolve an album page from lucida.to.
+pub enum ResolveAlbumResult {
+    /// Successfully fetched HTML.
+    Success(String),
+    /// Blocked by Cloudflare (403 or challenge page).
+    Cloudflare,
+    /// Other retryable error.
+    Error,
 }
 
 pub type FormatStats = Arc<Mutex<HashMap<String, usize>>>;

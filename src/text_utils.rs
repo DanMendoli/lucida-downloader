@@ -7,18 +7,15 @@ pub fn sanitize_file_name(name: &str) -> String {
         .replace(['\\', '/', ':', '*', '?', '"', '<', '>', '|'], "_")
 }
 
-pub fn parse_enclosed_value<'a>(start_marker: &str, end_marker: &str, text: &'a str) -> &'a str {
-    let start_index = text
-        .find(start_marker)
-        .unwrap_or_else(|| panic!("{start_marker} not found in {text}"))
-        + start_marker.len();
+pub fn parse_enclosed_value<'a>(
+    start_marker: &str,
+    end_marker: &str,
+    text: &'a str,
+) -> Option<&'a str> {
+    let start_index = text.find(start_marker)? + start_marker.len();
+    let end_index = text[start_index..].find(end_marker)? + start_index;
 
-    let end_index = text[start_index..]
-        .find(end_marker)
-        .unwrap_or_else(|| panic!("{end_marker} not found in {text}"))
-        + start_index;
-
-    &text[start_index..end_index]
+    Some(&text[start_index..end_index])
 }
 
 pub fn format_track_stem(

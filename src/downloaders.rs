@@ -5,23 +5,22 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures::future;
-use reqwest::Client;
 use tokio::fs::File;
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::{fs, time};
 
 use crate::models::{
-    AlbumInfo, AlbumYear, DownloadConfig, PageData, Service, SkipConfig, Track, TrackDownload,
-    WorkerIds,
+    AlbumInfo, AlbumYear, DownloadConfig, PageData, ResolveAlbumResult, Service, SkipConfig, Track,
+    TrackDownload, WorkerIds,
 };
-use crate::{requests, text_utils, workers};
+use crate::{browser_pool, requests, text_utils, workers};
 
 #[expect(
     clippy::too_many_arguments,
     reason = "this function is called from a single place"
 )]
 pub async fn download_album(
-    client: Client,
+    shared_client: browser_pool::SharedClient,
     url: &str,
     output_path: &Path,
     force_download: bool,
@@ -34,7 +33,7 @@ pub async fn download_album(
     running: Arc<AtomicBool>,
     album_worker: usize,
 ) {
-    let Some(page_data) = resolve_album(&client, url, &config, &running, album_worker).await else {
+    let Some(page_data) = resolve_album(&shared_client, url, &config, &running, album_worker).await else {
         return;
     };
 
@@ -96,7 +95,7 @@ pub async fn download_album(
 
         for result in future::join_all((1..=worker_count).map(|track_worker| {
             tokio::spawn(workers::run_track_worker(
-                client.clone(),
+                shared_client.clone(),
                 page_data.original_service,
                 tracks.clone(),
                 album.track_count,
@@ -123,7 +122,7 @@ pub async fn download_album(
     }
 
     download_album_cover(
-        client,
+        shared_client.clone(),
         &album.title,
         page_data.original_service,
         &album.cover_artwork_url,
@@ -136,56 +135,193 @@ pub async fn download_album(
 }
 
 async fn resolve_album(
-    client: &Client,
+    shared_client: &browser_pool::SharedClient,
     url: &str,
     config: &DownloadConfig,
     running: &Arc<AtomicBool>,
     album_worker: usize,
 ) -> Option<PageData> {
+    const RETRIES_PER_COUNTRY: usize = 4;
+    const MAX_WARMING_UP_RETRIES: usize = 2;
+
+    let url = normalize_qobuz_url(url);
+
     eprintln!("[WORKER {album_worker}] resolving album {url}");
 
-    loop {
-        let html =
-            requests::resolve_album(client, url, &config.country, running, album_worker).await?;
+    let countries = country_fallbacks(&config.country);
+    let mut warming_up_attempts = 0;
+    let mut cloudflare_retries = 0;
+    const MAX_CLOUDFLARE_RETRIES: usize = 3;
 
-        if let Some(error) = [
-            "An error occured trying to process your request.",
-            "Message: \"Cannot contact any valid server\"",
-            "An error occurred. Had an issue getting that item, try again.",
-        ]
-        .into_iter()
-        .find(|&error| html.contains(error))
-        {
-            eprintln!("[WORKER {album_worker}] HTML contains error: {error}");
+    for (attempt, country) in countries.iter().enumerate() {
+        if attempt > 0 {
+            eprintln!("[WORKER {album_worker}] retrying with country={country}");
+        }
 
-            if !running.load(Ordering::Relaxed) {
+        for retry in 1..=RETRIES_PER_COUNTRY {
+            // Get a fresh client (cookies may have been refreshed by a previous iteration)
+            let client = shared_client.get();
+
+            let html = match requests::resolve_album(
+                &client, &url, country, running, album_worker,
+            )
+            .await
+            {
+                ResolveAlbumResult::Success(html) => html,
+                ResolveAlbumResult::Cloudflare => {
+                    if cloudflare_retries < MAX_CLOUDFLARE_RETRIES {
+                        cloudflare_retries += 1;
+                        eprintln!(
+                            "[WORKER {album_worker}] Cloudflare block detected, refreshing cookies ({cloudflare_retries}/{MAX_CLOUDFLARE_RETRIES})..."
+                        );
+                        shared_client.refresh();
+                        time::sleep(Duration::from_secs(3)).await;
+                        continue;
+                    }
+                    eprintln!("[WORKER {album_worker}] too many Cloudflare blocks, giving up");
+                    return None;
+                }
+                ResolveAlbumResult::Error => {
+                    eprintln!(
+                        "[WORKER {album_worker}] error resolving album (country={country}, retry {retry}/{RETRIES_PER_COUNTRY})"
+                    );
+                    time::sleep(Duration::from_secs(5 * u64::try_from(retry).unwrap())).await;
+                    continue;
+                }
+            };
+
+            // Check for warming up or known error messages in the HTML
+            // (same logic as before, now that we have the HTML)
+            if html.contains("Enable JavaScript and cookies to continue")
+                || html.contains("challenge-platform")
+                || html.contains("cf-chl-widget-")
+                || html.contains("Checking your browser before accessing")
+                || html.contains("__cf_chl_jschl_tk__")
+            {
+                if cloudflare_retries < MAX_CLOUDFLARE_RETRIES {
+                    cloudflare_retries += 1;
+                    eprintln!(
+                        "[WORKER {album_worker}] Cloudflare challenge in HTML, refreshing cookies ({cloudflare_retries}/{MAX_CLOUDFLARE_RETRIES})..."
+                    );
+                    shared_client.refresh();
+                    time::sleep(Duration::from_secs(3)).await;
+                    continue;
+                }
+                eprintln!("[WORKER {album_worker}] too many Cloudflare blocks, giving up");
                 return None;
             }
 
-            time::sleep(Duration::from_secs(5)).await;
-            continue;
-        }
+            if html.contains("Site's still warming up") {
+                warming_up_attempts += 1;
 
-        let data_json = text_utils::parse_enclosed_value(
-            ",{\"type\":\"data\",\"data\":",
-            ",\"uses\":{\"url\":1}}];\n",
-            &html,
-        );
+                if warming_up_attempts > MAX_WARMING_UP_RETRIES {
+                    eprintln!(
+                        "[WORKER {album_worker}] lucida.to keeps warming up; the site may be unavailable or your --cf-clearance cookie is stale"
+                    );
+                    return None;
+                }
 
-        match json5::from_str::<PageData>(data_json) {
-            Ok(page_data) => return Some(page_data),
-            Err(err) => {
-                eprintln!("[WORKER {album_worker}] failed to parse album data: {err}");
-                eprintln!("[WORKER {album_worker}] extracted JSON snippet: {data_json:.200}");
+                eprintln!(
+                    "[WORKER {album_worker}] lucida.to is warming up, waiting 10 seconds before retrying ({warming_up_attempts}/{MAX_WARMING_UP_RETRIES})"
+                );
 
                 if !running.load(Ordering::Relaxed) {
                     return None;
                 }
 
-                time::sleep(Duration::from_secs(5)).await;
+                time::sleep(Duration::from_secs(10)).await;
+                continue;
+            }
+
+            if let Some(error) = [
+                "An error occured trying to process your request.",
+                "Message: \"Cannot contact any valid server\"",
+                "An error occurred. Had an issue getting that item, try again.",
+            ]
+            .into_iter()
+            .find(|&error| html.contains(error))
+            {
+                eprintln!(
+                    "[WORKER {album_worker}] HTML contains error: {error} (country={country}, retry {retry}/{RETRIES_PER_COUNTRY})"
+                );
+
+                if !running.load(Ordering::Relaxed) {
+                    return None;
+                }
+
+                time::sleep(Duration::from_secs(5 * u64::try_from(retry).unwrap())).await;
+                continue;
+            }
+
+            let Some(data_json) = text_utils::parse_enclosed_value(
+                ",{\"type\":\"data\",\"data\":",
+                ",\"uses\":{\"url\":1}}];\n",
+                &html,
+            ) else {
+                eprintln!(
+                    "[WORKER {album_worker}] could not find album data in page; retrying (html_len={})",
+                    html.len()
+                );
+                let debug_path = format!("/tmp/lucida_debug_{album_worker}_{retry}.html");
+                let _ = std::fs::write(&debug_path, &html);
+                eprintln!("[WORKER {album_worker}] saved HTML to {debug_path}");
+
+                if !running.load(Ordering::Relaxed) {
+                    return None;
+                }
+
+                time::sleep(Duration::from_secs(5 * u64::try_from(retry).unwrap())).await;
+                continue;
+            };
+
+            match json5::from_str::<PageData>(data_json) {
+                Ok(page_data) => return Some(page_data),
+                Err(err) => {
+                    eprintln!(
+                        "[WORKER {album_worker}] failed to parse album data: {err} (country={country}, retry {retry}/{RETRIES_PER_COUNTRY})"
+                    );
+                    eprintln!("[WORKER {album_worker}] extracted JSON snippet: {data_json:.200}");
+
+                    if !running.load(Ordering::Relaxed) {
+                        return None;
+                    }
+
+                    time::sleep(Duration::from_secs(5 * u64::try_from(retry).unwrap())).await;
+                }
             }
         }
     }
+
+    eprintln!(
+        "[WORKER {album_worker}] giving up on {url}; the album may be unavailable or the URL may be invalid"
+    );
+
+    None
+}
+
+fn country_fallbacks(country: &str) -> Vec<String> {
+    let mut countries = vec![country.to_string()];
+
+    if country == "auto" {
+        countries.extend(["us", "gb", "de", "fr"].iter().copied().map(String::from));
+    }
+
+    countries
+}
+
+fn normalize_qobuz_url(url: &str) -> String {
+    if !url.contains("qobuz.com") {
+        return url.to_string();
+    }
+
+    // Convert www.qobuz.com URLs to the format lucida.to handles best.
+    if (url.contains("www.qobuz.com") || url.contains("play.qobuz.com"))
+        && let Some(id) = url.rsplit('/').next().filter(|s| !s.is_empty())
+    {
+        return format!("https://play.qobuz.com/album/{id}");
+    }
+
+    url.to_string()
 }
 
 #[expect(
@@ -193,7 +329,7 @@ async fn resolve_album(
     reason = "this function is called from a single place"
 )]
 pub async fn request_and_download_track(
-    client: Client,
+    shared_client: browser_pool::SharedClient,
     service: Service,
     track: &Track,
     track_number: Option<u32>,
@@ -235,7 +371,7 @@ pub async fn request_and_download_track(
     eprintln!("{workers} downloading track {}", track.title);
 
     request_track_download(
-        client,
+        shared_client,
         track,
         file_stem,
         token_expiry,
@@ -252,7 +388,7 @@ pub async fn request_and_download_track(
     reason = "this function is called from a single place"
 )]
 async fn request_track_download(
-    client: Client,
+    shared_client: browser_pool::SharedClient,
     track: &Track,
     file_stem: String,
     token_expiry: u64,
@@ -264,6 +400,7 @@ async fn request_track_download(
     let mut current_downscale = config.downscale.clone();
 
     'request_track_download: loop {
+        let client = shared_client.get();
         let mut current_config = config.clone();
         current_config.downscale = current_downscale.clone();
 
@@ -351,7 +488,7 @@ async fn request_track_download(
         }
 
         if !download_track(
-            client.clone(),
+            shared_client.clone(),
             track_download,
             album_path.clone(),
             file_stem.clone(),
@@ -373,7 +510,7 @@ async fn request_track_download(
 }
 
 async fn download_track(
-    client: Client,
+    shared_client: browser_pool::SharedClient,
     track_download: TrackDownload,
     album_path: Arc<PathBuf>,
     file_stem: String,
@@ -381,6 +518,7 @@ async fn download_track(
     running: Arc<AtomicBool>,
     workers: WorkerIds,
 ) -> bool {
+    let client = shared_client.get();
     let Some((mut rx, mime_type)) =
         requests::download_track(&client, &track_download, workers).await
     else {
@@ -446,7 +584,7 @@ async fn download_track(
     reason = "this function is called from a single place"
 )]
 pub async fn download_album_cover(
-    client: Client,
+    shared_client: browser_pool::SharedClient,
     title: &str,
     service: Service,
     url: &str,
@@ -476,6 +614,7 @@ pub async fn download_album_cover(
     let part_path = album_path.join("cover.jpg.part");
 
     'download_album_cover: loop {
+        let client = shared_client.get();
         let Some(mut rx) =
             requests::download_album_cover(&client, &url, running.clone(), album_worker).await
         else {
